@@ -124,43 +124,106 @@ Después de normalizar, el producto punto = coseno.
 - `cos(SS, CB) ≈ 0.79`.
 - `cos(OP, CB) ≈ 0.69` → distintos autores, menos similares.
 
-## 7. Índice invertido
+## 7. Índice invertido ⭐
 
-Reemplaza matriz densa por listas de posting:
+Estructura base de todo motor de búsqueda. Invierte la relación natural: en vez de "doc → términos" guarda **"término → docs que lo contienen"**.
+
+### 7.1 Estructura — dos partes
 
 ```
-Term       Posting List (docID: tf)
-─────────────────────────────────────
-casa       [1:1, 2:1, 3:2, 4:1]
-grande     [1:1, 3:2]
-gato       [2:1]
+   DICCIONARIO             POSTING LISTS
+   (vocabulario)           (una por término)
+   ──────────────          ───────────────────────────
+   casa      ── df=4 ──▶   [1:1, 2:1, 3:2, 4:1]
+   grande    ── df=2 ──▶   [1:1, 3:2]
+   gato      ── df=1 ──▶   [2:1]
 ```
 
-- Cada término → lista de documentos donde aparece, con tf.
-- Ordenada por docID → merge lineal.
+- **Diccionario**: términos únicos + puntero a su posting list. Vive en RAM (hash/BST/trie).
+- **Posting list**: por cada término, lista de entradas `(docID, tf, [posiciones]?)`.
+  - **Ordenada por docID ascendente** → habilita merge lineal.
+  - Guardar `tf` sirve para ranking. Guardar posiciones sirve para consultas de frase (`"casa grande"`).
 
-### Consulta AND — merge lineal
+### 7.2 ¿Por qué NO la matriz de incidencia? — espacio
+
+Matriz densa `|T| × |N|` (término × documento). Ejemplo típico:
+
+| Parámetro | Valor | Cálculo |
+|---|---|---|
+| N docs | 10^6 | — |
+| T términos únicos | 500 000 | — |
+| Celdas matriz | **5·10^11** | T · N |
+| Entradas no-cero | ~10^9 | promedio 1000 términos/doc |
+| **Sparsidad** | **~99.8% ceros** | |
+
+La matriz malgasta espacio guardando ceros. El índice invertido guarda solo lo no-cero → **~500× menos memoria** en el ejemplo, y crece con el corpus, no con `T·N`.
+
+### 7.3 Construcción básica (in-memory, ingenua)
+
+```
+para cada doc d:
+    tokens = preprocesar(d)               # tokenize, stem, stopwords
+    para cada término t en tokens:
+        posting[t][d] += 1                # acumula tf
+al final:
+    para cada t: ordenar posting[t] por docID
+```
+
+Para corpus grandes esto no cabe en RAM → **SPIMI / BSBI** (tema de S09).
+
+### 7.4 Operaciones sobre posting lists
+
+**AND — merge lineal `O(n+m)`**
 
 ```
 p1 → Bruto:  [2, 4, 8, 16, 32, 64, 128]
 p2 → Cesar:  [1, 2, 3, 5, 8, 13, 21, 34]
 
-recorrer ambos avanzando el menor:
+dos punteros, avanzar siempre el menor:
   Bruto=2, Cesar=1 → avanzar Cesar
   Bruto=2, Cesar=2 → MATCH, ambos avanzan
   Bruto=4, Cesar=3 → avanzar Cesar
   ...
-
-resultado: [2, 8]     O(n + m)
+resultado: [2, 8]
 ```
 
-### Consulta OR
+- **OR**: union con merge parecido, incluye el menor de los dos y avanza; si son iguales, incluye uno y avanza ambos.
+- **AND NOT** (`t1 AND NOT t2`): recorre `p1`; cuando `p2` iguala, descarta y avanza ambos. `O(n+m)`.
 
-Union con merge similar, añade ambos si son distintos.
+**Optimización 1 — orden por `df` ascendente**
+En un `AND` de k términos, empezar por la posting list más corta. El resultado nunca puede ser mayor que la más pequeña.
 
-### Consulta NOT (t1 AND NOT t2)
+**Optimización 2 — skip pointers**
+Sobre posting lists ordenadas, agregar punteros de salto cada `√n` posiciones. Permite saltar bloques enteros durante el merge si sabes que el próximo docID de una lista es mucho mayor. Reduce el `O(n+m)` en la práctica (no en el peor caso).
 
-Recorrer p1 y saltarse los docs que aparezcan en p2. También `O(n+m)`.
+### 7.5 Índice invertido + ranking (TF-IDF / coseno)
+
+Para calcular `score(q, d)` sin recorrer todos los docs:
+
+```
+score[d] = 0 para todo d
+para cada término t en q:
+    leer posting_list(t)          # solo docs que contienen t
+    w_tq = (1+log tf_tq) · idf_t
+    para cada (d, tf_td) en la lista:
+        w_td = (1+log tf_td) · idf_t
+        score[d] += w_tq · w_td
+para cada d con score>0:
+    score[d] /= |d|               # normalización coseno
+devolver top-K por heap
+```
+
+- Solo se tocan documentos que contienen **al menos un término de la query** → enorme ahorro si `|q|` es pequeño.
+- `|d|` (norma del vector doc) se **precalcula** al construir el índice y se guarda aparte.
+
+### 7.6 Variantes del posting
+
+| Variante | Guarda | Sirve para |
+|---|---|---|
+| Docs-only | `docID` | Booleano AND/OR |
+| Frequency | `docID, tf` | TF-IDF, coseno |
+| Positional | `docID, tf, [pos1, pos2, …]` | Consultas de frase, proximidad |
+| Field-based | `docID, tf` por campo (título, body…) | Boosting por zona |
 
 ## 8. Precision & Recall
 
