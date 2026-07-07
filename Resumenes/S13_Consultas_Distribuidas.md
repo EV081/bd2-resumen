@@ -355,6 +355,31 @@ ORDER BY MontoTotal DESC;
 
 **Problema**: el JOIN es por `Ciudad`, pero las tablas NO están fragmentadas por Ciudad → hay que **reparticionar**.
 
+**Gráfico del flujo**:
+
+```
+    S1: P1, R1                S2: P2, R2                S3: P3, R3
+        │                         │                         │
+        ▼ reparticionar Rep       ▼ reparticionar Rep       ▼ reparticionar Rep
+        ▼ reparticionar Ped       ▼ reparticionar Ped       ▼ reparticionar Ped
+        (por Ciudad)              (por Ciudad)              (por Ciudad)
+    ┌───────────┐             ┌───────────┐             ┌───────────┐
+    │Ciudad grp1│             │Ciudad grp2│             │Ciudad grp3│
+    └────┬──────┘             └────┬──────┘             └────┬──────┘
+         │ JOIN + GROUP BY Ciudad local
+         ▼                         ▼                         ▼
+    (Ciudad,TotalRep,Monto)  (Ciudad,...)             (Ciudad,...)
+         │
+         ▼ reparticionar por RANGE(MontoTotal)
+    ┌───────────┐             ┌───────────┐             ┌───────────┐
+    │Monto rgo1 │             │Monto rgo2 │             │Monto rgo3 │
+    └────┬──────┘             └────┬──────┘             └────┬──────┘
+         │ ordenar local (ya viene ordenado por rango)
+         └────────────── concatenar en orden ──────────────────┘
+                                 ▼
+                            Coordinador
+```
+
 **Pseudocódigo**:
 
 ```
@@ -427,6 +452,34 @@ ORDER BY V.MontoTotal DESC, V.FechaVenta;
 - Nodo C trabaja con `C_C, V_C` (Pais=C) → JOIN LOCAL.
 - Nodo B queda **libre** — se le puede usar para el sort intermedio.
 
+**Gráfico del flujo**:
+
+```
+    S_A: C_A, V_A            S_B: C_B, V_B            S_C: C_C, V_C
+    (Pais=A)                 (Pais=B, no aplica)      (Pais=C)
+        │                         │                         │
+        │ WHERE Pais IN (A,C)     │ ⟵ descartado por        │
+        │                         │   localización           │
+        ▼                         ✗                         ▼
+    JOIN local                                          JOIN local
+    V_A ⋈_IDCliente C_A                                 V_C ⋈_IDCliente C_C
+    (funciona porque V_A es                             (idem)
+     derivado de C_A ⇒ mismo nodo)
+        │                                                    │
+        ▼ proyectar Nombre, Apellidos,                       ▼
+        │  FechaVenta, MontoTotal                            │
+        ▼ ORDER BY MontoTotal DESC, FechaVenta               ▼
+    ┌───────────────┐                              ┌───────────────┐
+    │s_A.res orden. │                              │s_C.res orden. │
+    └───────┬───────┘                              └───────┬───────┘
+            │                                              │
+            └────────────► MERGE de streams ◄──────────────┘
+                     (en S_B libre, o en coordinador)
+                                 │
+                                 ▼
+                            Resultado final
+```
+
 **Pseudocódigo**:
 
 ```
@@ -470,6 +523,29 @@ ORDER BY count(*) DESC;
 3. GROUP BY Especialidad **parcial** local.
 4. Agregación final (por hash de Especialidad o centralizada — Especialidad tiene ≤20 valores, no vale la pena reparticionar).
 5. ORDER BY count DESC → centralizado sobre pocas filas.
+
+**Gráfico del flujo**:
+
+```
+    S1: Med(Esp₁) Pac(año h=0)   S2: Med(Esp₂) Pac(año h=1)   S3: Med(Esp₃) Pac(año h=2)
+        │                              │                              │
+        ▼ reparticionar Med por HASH(DNI_Medico)                       ▼
+        ▼ reparticionar Pac por HASH(DNI_Paciente)                     ▼
+    ┌────────────────┐          ┌────────────────┐          ┌────────────────┐
+    │ h(DNI) mod 3=0 │          │ h(DNI) mod 3=1 │          │ h(DNI) mod 3=2 │
+    └────────┬───────┘          └────────┬───────┘          └────────┬───────┘
+             │ JOIN local Med ⋈ Pac (DNI)
+             │ + GROUP BY Especialidad PARCIAL local
+             ▼                          ▼                            ▼
+    (Especialidad, c)           (Especialidad, c)              (Especialidad, c)
+             │                          │                            │
+             └────────────►  UNION en coordinador  ◄─────────────────┘
+                          + SUM(c) GROUP BY Especialidad
+                          + ORDER BY Conteo DESC
+                                     │
+                                     ▼
+                                Resultado final
+```
 
 ```
 -- Reparticionar por HASH(DNI)
